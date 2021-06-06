@@ -1,0 +1,720 @@
+/*
+   Script for the function model
+*/
+
+// libraries
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ezButton.h>
+#include <dht.h>                // TempHum sensor 
+
+// setup of OLED
+#define SCREEN_WIDTH 128 // OLED display width,  in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+Adafruit_SSD1306 oled(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1); // declare an SSD1306 display object connected to I2C
+
+// setup of accelerometer
+const int MPU_ADDR = 0x68; // I2C address of the MPU-6050. If AD0 pin is set to HIGH, the I2C address will be 0x69.
+int16_t accelerometer_x, accelerometer_y, accelerometer_z; // variables for accelerometer raw data
+
+// define DHT sensor
+dht DHT;
+
+// setup of pins
+const int buzzerPin = 9;
+const int buttonPin = 7;
+const int DHT11Pin = 4;
+const int lightPin = A0;
+const int soundPin = 3;
+
+ezButton button(buttonPin); // create ezButton object that attach to buttonPin;
+
+// define types
+#define work 0
+#define breakTime 1
+#define variation 2
+#define temp 3
+#define hum 4
+#define noise 5
+#define light 6
+
+// variables
+unsigned long currentMillis;
+
+// variables for work og break mode
+int workMode = work; // work if the user is working, breakTime if the user is taking a break
+unsigned long previousMillisworkMode = 0; // store last time workMode changed
+int breakPostpone = 0;  // 0 if no postpone, 1 for first postpone, 2 for skipping break
+unsigned long workInterval = 3600000; // work interval (60 min)
+unsigned long breakInterval = 600000;  // break interval (10 min)
+unsigned long previousMillisBreakAlert = 0;  // store the time of a break alert
+unsigned long previousMillisWorkAlert = 0;   // store the time of a work alert
+unsigned long postponeTime = 600000; // postpone time for breaks (10 min)
+unsigned long breakEndReminder = 120000; // reminder to start work after break has ended (2 min)
+int workBreakAlertTrigger = 0;  // 0 until the first alert, then 1 until flipped to new break or work session
+
+// variables for variation
+unsigned long previousMillisVari = 0;  // store last time variation was changed
+unsigned long variInterval = 4500000; // variation interval (75 min)
+
+// variables for air quality, light, and noise
+// NB! The sensitivity of the noise alert is made by adjusting the potentiometer on the sound module
+int tempAlertTrigger = 0; // 0 until first temp alert, then 1
+unsigned long previousMillisTempAlert = 0;  // store last time temp alert was given
+int humAlertTrigger = 0; // 0 until first humidity alert, then 1
+unsigned long previousMillisHumAlert = 0;  // store last time humidity alert was given
+int lightAlertTrigger = 0; // 0 until first light alert, then 1
+unsigned long previousMillisLightAlert = 0;  // store last time light alert was given
+int noiseAlertTrigger = 0; // 0 until first noise alert, then 1
+unsigned long previousMillisNoiseAlert = 0; // store last time noise alert was given
+
+// variables for alerts
+int alertType = 0;  // refers to the defined types above
+bool alertActive = false; // false if no alert, true if there is an alert
+unsigned long breakAlertDuration = (30 * 1000);  // the duration of break alerts before resolving automatically
+unsigned long alertDuration = (2 * 1000);  // the duration of alerts for work, air quality, noise, and light
+bool displayActive = false; // false if no text, true if there is text
+unsigned long previousMillisDisplay = 0;  // store the time of displaying text
+unsigned long displayDuration = (30000);  // duration of displaying text
+unsigned long alertIdle = 1800000; // time interval for alerts to be idle (air quality, noise, and light)
+
+// variables for accelerometer
+unsigned long previousMillisAccelReading = 0;  // store last time a reading was taken for accelerometer
+unsigned long accelReadingInterval = 1000; // interval for reading accelerometer
+int flipped = work;  // work if Worky is right side up (work mode), breakTime if Worky is upside down (break mode)
+float acc = 0;  // computed acceleration
+float X;
+float Y;
+float Z;
+float alertAcc = 0; // acceleration at moment of alert
+int sigDiff = 400; // significant difference in acceleration, 500 was too much, 450 was ok, 350 was too sensitive, 400 is good
+
+// variables for sensors
+unsigned long previousMillisSensor = 0; // store las time a reading was taken from the sensors
+unsigned long sensorInterval = 2000;  // interval for reading sensors (must be at least 2000 for dht sensor to work)
+unsigned long previousMillisNoiseSensor = 0;  // store las time a reading was taken from the noise sensor
+unsigned long noiseSensorInterval = 200; // interval for reading noise sensors
+
+// variables for buzzer
+unsigned long previousMillisBuzzer = 0; // store last time buzzer was updated
+unsigned long buzzerInterval = 500;     // interval at which to blink
+int buzzerState = LOW;         // buzzer state used to set the buzzer
+
+// threshold variables
+int tempMin = 18;
+int tempMax = 25;
+int humMin = 25;
+int humMax = 60;
+int lightMin = 40;  // preliminary, not converted to LUX or Lumen
+int lightMax = 190; // preliminary, not converted to LUX or Lumen
+
+// testing variables. NB! Arduino doesn't like multiplying big numbers, so don't enter 60*1000 but instead 1*60000
+//unsigned long workInterval = (5 * 60000);  // work interval
+//unsigned long breakInterval = (1 * 60000);  // break interval
+//unsigned long variInterval = (7 * 60000);  // variation of position interval
+//unsigned long postponeTime = (2 * 60000); // postpone time for breaks
+//unsigned long breakEndReminder = (1 * 60000); // reminder to start work after break has ended
+//int tempMax = 45;
+//int humMin = 15;
+//int lightMax = 200;
+
+void setup() {
+  Serial.begin(9600);
+  Serial.println(F("Booted"));
+
+  // initialize OLED display with address 0x3C for 128x64
+  if (!oled.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (true);
+  }
+  delay(2000);         // wait for initializing
+  oled.clearDisplay(); // clear display
+
+  // initialize accelerometer
+  Wire.begin();
+  Wire.beginTransmission(MPU_ADDR); // Begins a transmission to the I2C slave (GY-521 board)
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0); // set to zero (wakes up the MPU-6050)
+  Wire.endTransmission(true);
+
+  // set pins as output/input
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(soundPin, INPUT);
+
+  button.setDebounceTime(50); // set debounce time to 50 milliseconds
+
+  // display welcome message
+  oled.setTextSize(2);                  // text size
+  oled.setTextColor(WHITE);             // text color
+  oled.setCursor(0, 0);                 // position to display
+  oled.println(F("Hello!"));            // text to display
+  oled.println(F("Push the"));
+  oled.println(F("button to"));
+  oled.println(F("start"));
+  oled.display();                       // show on OLED
+
+  // wait to start until button is pressed
+  Serial.println(F("Hello! Push the button to start"));
+  while (!button.isPressed())
+    button.loop(); // MUST call the loop() function first
+
+  // save the time for timers so that the timers starts at push of button
+  unsigned long currentMillis = millis();
+  previousMillisworkMode = currentMillis;
+  previousMillisVari = currentMillis;
+
+  // print instructions after start
+  displayActive = true;
+  previousMillisDisplay = currentMillis;
+  oled.clearDisplay();                    // clear display
+  oled.setCursor(0, 0);                   // position to display
+  oled.println(F("Start your"));          // text to display
+  oled.println(F("work now"));
+  oled.display();                         // show on OLED
+  Serial.println(F("Button pressed. Start your work now"));
+}
+
+void loop() {
+  button.loop(); // MUST call the loop() function first
+  unsigned long currentMillis = millis(); // check the time
+
+  /*
+     Read the accelerometer to check the orientation of Worky
+     If the orientation changes, start work og break mode
+  */
+  // check orientation of Worky by accelerometer
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); // starting with register 0x3B (ACCEL_XOUT_H) [MPU-6000 and MPU-6050 Register Map and Descriptions Revision 4.2, p.40]
+  Wire.endTransmission(false); // the parameter indicates that the Arduino will send a restart. As a result, the connection is kept active.
+  Wire.requestFrom(MPU_ADDR, 7 * 2, true); // request a total of 7*2=14 registers
+
+  // get a reading every when accelReadingInterval has passed
+  if (currentMillis - previousMillisAccelReading > accelReadingInterval) {
+    // save the time
+    previousMillisAccelReading = currentMillis;
+    // get a reading of the acceleromenter. "Wire.read()<<8 | Wire.read();" means two registers are read and stored in the same variable
+    accelerometer_x = Wire.read() << 8 | Wire.read(); // reading registers: 0x3B (ACCEL_XOUT_H) and 0x3C (ACCEL_XOUT_L)
+    accelerometer_y = Wire.read() << 8 | Wire.read(); // reading registers: 0x3D (ACCEL_YOUT_H) and 0x3E (ACCEL_YOUT_L)
+    accelerometer_z = Wire.read() << 8 | Wire.read(); // reading registers: 0x3F (ACCEL_ZOUT_H) and 0x40 (ACCEL_ZOUT_L)
+  }
+
+  // check orientation of Worky
+  // z is approx. >17,000 when right side up and approx. <-15,000 when upside down
+  // if Worky is right side up, the user is working
+  if (accelerometer_z > 10000 ) {
+    // update flipped to work if it isn't already
+    if ( flipped != work ) {
+      flipped = work;
+    }
+    // if Worky is right side up, but workMode != work, Worky was just flipped right side up
+    // this marks the start of a new work session, so start work mode
+    if (workMode != work)  {
+      // change workMode and save the time
+      workMode = work;
+      previousMillisworkMode = currentMillis;
+      //reset breakEndReminder and workBreakAlertTrigger
+      breakEndReminder = (2 * 60000);
+      workBreakAlertTrigger = 0;
+      // write to display
+      displayActive = true;
+      previousMillisDisplay = currentMillis;
+      oled.clearDisplay();
+      oled.setCursor(0, 0);
+      oled.println(F("Nice break"));
+      oled.println(F("Continue"));
+      oled.println(F("your work"));
+      oled.display();
+      Serial.println(F("Work session started by flip"));
+    }
+  }
+  // if Worky is upside down, the user is taking a break
+  if (accelerometer_z < -10000 ) {
+    // update flipped to breakTIme if it isn't already
+    if ( flipped != breakTime ) {
+      flipped = breakTime;
+    }
+    // if Worky is upside down but workMode == work, Worky was just flipped upside down
+    // this marks the start of a new break, sp start break mode
+    if (workMode == work) {
+      // change workMode, save the time, and reset breakPostpone
+      workMode = breakTime;
+      previousMillisworkMode = currentMillis;
+      breakPostpone = 0;
+      Serial.println(F("Break started by flip"));
+      // Clear display. Don't write to the display because it is facing down
+      displayActive = false;
+      oled.clearDisplay();
+      oled.display();
+    }
+  }
+  // convert accelerometer readings to floats and compute acceleration
+  X = float(accelerometer_x);
+  Y = float(accelerometer_y);
+  Z = float(accelerometer_x);
+  float acc = sqrt(X * X + Y * Y + Z * Z);
+
+
+
+  /*
+     Check work interval
+  */
+  // if work mode is running
+  if (workMode == work)  {
+    // check if work interval is up
+    // if the user has not postponed or skipped a break
+    if ( breakPostpone == 0 ) {
+      // if work interval is over, give break alert
+      if ((currentMillis - previousMillisworkMode > workInterval) && (flipped == work)) {
+        // if there is no alert, give alert and save the position of Worky
+        if ( alertActive == false ) {
+          alertType = breakTime;
+          alertActive = true;
+          previousMillisBreakAlert = currentMillis;
+          alertAcc = acc;
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();            // clear display
+          oled.setCursor(0, 0);           // position to display
+          oled.println(F("Take a"));      // text to display
+          oled.println(F("10 min"));
+          oled.println(F("break now!"));
+          oled.display();                 // show on OLED;
+          Serial.println(F("ALERT. Normal work ended, break time"));
+        }
+      }
+    }
+
+    // if the user has postponed a break
+    if ( breakPostpone == 1 ) {
+      // if work interval + postponeTime is over, give break alert
+      if ((currentMillis - previousMillisworkMode > workInterval + postponeTime) && (flipped == work)) {
+        // if there is no alert, give alert and save the position of Worky
+        if ( alertActive == false ) {
+          alertType = breakTime;
+          alertActive = true;
+          previousMillisBreakAlert = currentMillis;
+          alertAcc = acc;
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();            // clear display
+          oled.setCursor(0, 0);           // position to display
+          oled.println(F("Take a"));      // text to display
+          oled.println(F("10 min"));
+          oled.println(F("break now!"));
+          oled.display();                 // show on OLED;
+          Serial.println(F("ALERT. Postponed work ended, break time"));
+        }
+      }
+    }
+
+    // if the user has skipped a break
+    if ( breakPostpone == 2 ) {
+      // if work interval is over, give break alert. NB! When skipping a break by moving Worky, previousMillisworkMode is updated to trigger a new break alert after 2 consecutive work sessions
+      if ((currentMillis - previousMillisworkMode > workInterval) && (flipped == work)) {
+        // if there is no alert, give alert and save the position of Worky
+        if ( alertActive == false ) {
+          alertType = breakTime;
+          alertActive = true;
+          previousMillisBreakAlert = currentMillis;
+          alertAcc = acc;
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();            // clear display
+          oled.setCursor(0, 0);           // position to display
+          oled.println(F("Take a"));      // text to display
+          oled.println(F("10 min"));
+          oled.println(F("break now!"));
+          oled.display();                 // show on OLED;
+          Serial.println(F("ALERT. 2 consecutive work sessions ended, break time"));
+        }
+        // reset breakPostpone
+        breakPostpone = 0;
+      }
+    }
+  }
+
+
+
+  /*
+     Check break interval
+  */
+  // if break mode is running
+  if (workMode == breakTime ) {
+    // check if break interval is up
+    // if break interval is up, Worky is flipped on its head, and this is the first work alert, give the following alert
+    if ((currentMillis - previousMillisworkMode > breakInterval) && (flipped == breakTime) && (workBreakAlertTrigger == 0)) {
+      // if there is no alert, give alert and save the position of Worky
+      if ( alertActive == false ) {
+        alertActive = true;
+        previousMillisWorkAlert = currentMillis;
+        alertAcc = acc;
+        // change alertType and alertActive. Change workBreakAlertTrigger since this was the first alert
+        workBreakAlertTrigger = 1;
+        alertType = work;
+        Serial.println(F("ALERT. Break ended, start work session"));
+        // don't write to display because it is facing down
+      }
+    }
+    // if the user has received an alert to start work, but Worky is not flipped to work mode after breakEndReminder of previous alert, give alert again
+    if ( (currentMillis - previousMillisWorkAlert > breakEndReminder) && (flipped == breakTime) && (workBreakAlertTrigger == 1)) {
+      // if there is no alert, give alert and save the position of Worky
+      if ( alertActive == false ) {
+        alertType = work;
+        alertActive = true;
+        previousMillisWorkAlert = currentMillis;
+        alertAcc = acc;
+        Serial.println(F("ALERT. Break ended some time ago, start work session"));
+        // don't write to display because it is facing down
+      }
+    }
+  }
+
+
+
+  /*
+     Check variation interval
+  */
+  // if variation interval is up
+  if (currentMillis - previousMillisVari > variInterval) {
+    // only update the time of previousMillisVari and give alert, if work mode is running and there are no other alerts
+    if (workMode == work && alertActive == false && displayActive == false) {
+      // save the time
+      previousMillisVari = currentMillis;
+      // change alertType and alertActive
+      alertType = variation;
+      alertActive = true;
+      Serial.println(F("ALERT. Variation"));
+      // write to display
+      displayActive = true;
+      previousMillisDisplay = currentMillis;
+      oled.clearDisplay();            // clear display
+      oled.setCursor(0, 0);           // position to display
+      oled.println(F("Vary your"));    // text to display
+      oled.println(F("position!"));
+      oled.display();                 // show on OLED;
+    }
+  }
+
+
+  /*
+     Check air quality and light at sensorInterval
+  */
+  if (currentMillis - previousMillisSensor > sensorInterval) {
+    // save the time of the reading and get readings
+    previousMillisSensor = currentMillis;
+    int chk = DHT.read11(DHT11Pin);
+    int lightLevel = analogRead(lightPin);
+
+    /*
+      Check light level inside this loop
+    */
+    /*
+      // write light level to serial monitor
+      Serial.print("Light level value : ");
+      Serial.println(lightLevel);
+    */
+    // if threshold value is exceeded
+    if ( (lightLevel <= lightMin) || (lightLevel >= lightMax) ) {
+      Serial.println(F("Light threshold exceeded"));
+      // only give alert if work mode is engaged and no other alerts are activated
+      if (workMode == work && alertActive == false && displayActive == false)  {
+        // if this is the first light alert, give it right away. If it is not the first, only give the alert if alertIdle has passed
+        if ( (lightAlertTrigger == 0) || ( (lightAlertTrigger == 1) && (currentMillis - previousMillisLightAlert > alertIdle) ) )  {
+          // save the time for alert triggering
+          previousMillisLightAlert = currentMillis;
+          // set alertType, alertActive, and alert trigger
+          alertType = light;
+          alertActive = true;
+          lightAlertTrigger = 1;
+          // for too low light
+          if (lightLevel <= lightMin) {
+            // write to display
+            displayActive = true;
+            previousMillisDisplay = currentMillis;
+            oled.clearDisplay();
+            oled.setCursor(0, 0);
+            oled.println(F("Your light"));
+            oled.println(F("level is"));
+            oled.println(F("too low!"));
+            oled.display();
+            Serial.println(F("ALERT! Light level is too low. Do something"));
+          }
+          // for too high light
+          if (lightLevel >= lightMax) {
+            // write to display
+            displayActive = true;
+            previousMillisDisplay = currentMillis;
+            oled.clearDisplay();
+            oled.setCursor(0, 0);
+            oled.println(F("Your light"));
+            oled.println(F("level is"));
+            oled.println(F("too high!"));
+            oled.display();
+            Serial.println(F("ALERT! Light level is too high. Do something"));
+          }
+        }
+      }
+    }
+  }
+
+
+
+  /*
+     Check air quality
+  */
+  // give alert for temperature
+  if ((DHT.temperature  < tempMin) || (DHT.temperature > tempMax))  {
+    Serial.println(F("Temperature threshold exceeded"));
+    // only give alert if work mode is engaged and no other alerts are activated
+    if (workMode == work && alertActive == false && displayActive == false)  {
+      // if this is the first temp alert, give it right away. If it is not the first, only give the alert if alertIdle has passed
+      if ( (tempAlertTrigger == 0) || ( (tempAlertTrigger == 1) && (currentMillis - previousMillisTempAlert > alertIdle) ) )  {
+        // save the time for alert triggering
+        previousMillisTempAlert = currentMillis;
+        // set alertType, alertActive, and alert trigger
+        alertType = temp;
+        alertActive = true;
+        tempAlertTrigger = 1;
+        // for too low temp
+        if (DHT.temperature < tempMin) {
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Temp too"));
+          oled.println(F("low! Turn"));
+          oled.println(F("the heat"));
+          oled.println(F("up a bit"));
+          oled.display();
+          Serial.println(F("ALERT! Temperature is too low. Do something"));
+        }
+        // for too high temp
+        if (DHT.temperature > tempMax) {
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Temp too"));
+          oled.println(F("high! Turn"));
+          oled.println(F("the heat"));
+          oled.println(F("down a bit"));
+          oled.display();
+          Serial.println(F("ALERT! Temperature is too high. Do something"));
+        }
+      }
+    }
+  }
+
+  // give alert for humidity
+  if ( (DHT.humidity  < humMin) || (DHT.humidity  > humMax) ) {
+    Serial.println(F("Humidity threshold exceeded"));
+    // only give alert if work mode is engaged and no other alerts are activated
+    if (workMode == work && alertActive == false && displayActive == false)  {
+      // if this is the first humidity alert, give it right away. If it is not the first, only give the alert if alertIdle has passed
+      if ( (humAlertTrigger == 0) || ( (humAlertTrigger == 1) && (currentMillis - previousMillisHumAlert > alertIdle) ) )  {
+        // save the time for alert triggering
+        previousMillisHumAlert = currentMillis;
+        // set alertType, alertActive, and alert trigger
+        alertType = hum;
+        alertActive = true;
+        humAlertTrigger = 1;
+        // for too low hum
+        if (DHT.humidity < humMin) {
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Hum too"));
+          oled.println(F("low! Get"));
+          oled.println(F("a plant"));
+          oled.display();
+          Serial.println(F("ALERT! Humidity is too low. Do something"));
+        }
+        // for too high hum
+        if (DHT.humidity > humMax) {
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Hum too"));
+          oled.println(F("high! Open"));
+          oled.println(F("a window"));
+          oled.display();
+          Serial.println(F("ALERT! Humidity is too high. Do something"));
+        }
+      }
+    }
+  }
+
+
+
+  /*
+       Check sound level
+  */
+  // get a reading at noiseSensorInterval
+  if (currentMillis - previousMillisNoiseSensor > noiseSensorInterval) {
+    // save the time of the reading and get readings
+    previousMillisNoiseSensor = currentMillis;
+    int soundLevel = digitalRead(soundPin);
+    // if the threshold value is exceeded, give alert
+    if ( soundLevel == 1) {
+      Serial.println(F("Noise registered!"));
+      // only give alert if work mode is engaged and no other alerts are activated
+      if (workMode == work && alertActive == false && displayActive == false)  {
+        // if this is the first noise alert, give it right away. If it is not the first, only give the alert if alertIdle has passed
+        if ( (noiseAlertTrigger == 0) || ( (noiseAlertTrigger == 1) && (currentMillis - previousMillisNoiseAlert > alertIdle) ) )  {
+          // save the time for alert triggering
+          previousMillisNoiseAlert = currentMillis;
+          // set alertType, alertActive, and alert trigger
+          alertType = noise;
+          alertActive = true;
+          noiseAlertTrigger = 1;
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Your sound"));
+          oled.println(F("level is"));
+          oled.println(F("too high!"));
+          oled.display();
+          Serial.println(F("ALERT! Sound level is too high. Do something"));
+        }
+      }
+    }
+  }
+
+
+
+  /*
+     Turn on alerts
+  */
+  if (alertActive == true) {
+    // if there is an alert continue to blink buzzer until resolved
+    // blink buzzer
+    if (currentMillis - previousMillisBuzzer >= buzzerInterval) {
+      // save the last time you blinked the buzzer
+      previousMillisBuzzer = currentMillis;
+      // if the buzzer is off turn it on and vice-versa:
+      if (buzzerState == LOW) {
+        buzzerState = HIGH;
+      } else {
+        buzzerState = LOW;
+      }
+      // set the buzzer with the buzzerState of the variable:
+      digitalWrite(buzzerPin, buzzerState);
+    }
+  }
+
+
+
+  /*
+     Resolve alerts
+  */
+  if (alertActive == true) {
+    // if it is a break alert
+    if ( alertType == breakTime ) {
+      // if Worky is flipped on its head, resolve alert and start break
+      if ( flipped == breakTime ) {
+        // turn off alert
+        digitalWrite(buzzerPin, LOW);
+        alertActive = false;
+        Serial.println(F("ALERT RESOLVE. Break alert by flip"));
+      }
+      // if Worky is moved or breakAlertDuration has passed and nothing has happened, resolve alert
+      else if ( acc < alertAcc - sigDiff || acc > alertAcc + sigDiff || currentMillis - previousMillisBreakAlert >= breakAlertDuration ) {
+        // turn off alert
+        digitalWrite(buzzerPin, LOW);
+        alertActive = false;
+        // increase breakPostpone by 1
+        breakPostpone ++;
+        // if it was the first postponement, the break is postponed
+        if (breakPostpone == 1) {
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Break is"));
+          oled.println(F("postponed"));
+          oled.println(F("by 10 min"));
+          oled.display();
+          Serial.println(F("ALERT RESOLVE. Break postponed by movement or timer"));
+        }
+        // if it was the second postponement, the break is skipped
+        if (breakPostpone == 2) {
+          // update previousMillisworkMode to trigger a new break alert after 2 consecutive work sessions
+          previousMillisworkMode = currentMillis - postponeTime;
+          // write to display
+          displayActive = true;
+          previousMillisDisplay = currentMillis;
+          oled.clearDisplay();
+          oled.setCursor(0, 0);
+          oled.println(F("Break is"));
+          oled.println(F("skipped"));
+          oled.display();
+          Serial.println(F("ALERT RESOLVE. Break skipped by movement or timer"));
+        }
+      }
+    }
+
+    // if it is a work alert, resolve after alertDuration
+    if ( alertType == work && currentMillis - previousMillisWorkAlert >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Work alert resolved by timer"));
+    }
+    // if it is a variation alert, resolve after alertDuration
+    if ( alertType == variation && currentMillis - previousMillisVari >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Variation alert resolved by timer"));
+    }
+    // if it is an air quality alert, resolve after alertDuration
+    // for temperature
+    if ( alertType == temp && currentMillis - previousMillisTempAlert >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Temperature alert resolved by timer"));
+    }
+    // for humidity
+    if ( alertType == hum && currentMillis - previousMillisHumAlert >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Humidity alert resolved by timer"));
+    }
+    // if it is a light alert, resolve after alertDuration
+    if ( alertType == light && currentMillis - previousMillisLightAlert >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Light alert resolved by timer"));
+    }
+    // if it is a noise alert, resolve after alertDuration
+    if ( alertType == noise && currentMillis - previousMillisNoiseAlert >= alertDuration ) {
+      digitalWrite(buzzerPin, LOW);
+      alertActive = false;
+      Serial.println(F("ALERT RESOLVE. Noise alert resolved by timer"));
+    }
+  }
+
+
+
+  /*
+     Turn of display after displayDuration
+  */
+  if ( displayActive == true && currentMillis - previousMillisDisplay >= displayDuration ) {
+    displayActive = false;
+    oled.clearDisplay();
+    oled.display();
+    Serial.println(F("Display cleared"));
+  }
+
+}
